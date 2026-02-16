@@ -1,6 +1,9 @@
 /* Tcl in ~ 500 lines of code.
  *
- * Copyright (c) 2007-2016, Salvatore Sanfilippo <antirez at gmail dot com>
+ * IMPORTANT: this is Picol version 2! For the original code, check
+ * the commit history of this repository.
+ *
+ * Copyright (c) 2007-2026, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,18 +30,53 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+
+/* =============================================================================
+ * Memory allocation wrappers that abort on out of memory
+ * ========================================================================== */
+
+void *xrealloc(void *ptr, size_t size) {
+    void *mem = realloc(ptr,size);
+    if (!mem) {
+        fprintf(stderr,"Out of memory realloc(%p,%zu)\n", ptr, size);
+        exit(1);
+    }
+    return mem;
+}
+
+#define xmalloc(size) xrealloc(NULL,size)
+
+char *xstrdup(const char *s) {
+    size_t l = strlen(s);
+    char *dup = xmalloc(l+1);
+    memcpy(dup,s,l+1);
+    return dup;
+}
+
+/* =============================================================================
+ * Data structures
+ * ========================================================================== */
 
 enum {PICOL_OK, PICOL_ERR, PICOL_RETURN, PICOL_BREAK, PICOL_CONTINUE};
-enum {PT_ESC,PT_STR,PT_CMD,PT_VAR,PT_SEP,PT_EOL,PT_EOF};
+enum {
+    PT_ESC, // String that may contain escapes (that should be processed)
+    PT_STR, // String without escapes, no post processing needed.
+    PT_CMD, // Command, that is [.... something ...]
+    PT_VAR, // Variable like $var
+    PT_SEP, // Arguments separator
+    PT_EOL, // End of command
+    PT_EOF  // End of file (stops the parsing loop)
+};
 
 struct picolParser {
-    char *text;
-    char *p; /* current text position */
-    int len; /* remaining length */
-    char *start; /* token start */
-    char *end; /* token end */
-    int type; /* token type, PT_... */
-    int insidequote; /* True if inside " " */
+    char *text;         // The program to parse
+    char *p;            // Current parsing position in 'text'
+    int len;            // Remaining length
+    char *start;        // Token start
+    char *end;          // Token end
+    int type;           // Token type, PT_...
+    int insidequote;    // True if inside " "
 };
 
 struct picolVar {
@@ -46,14 +84,17 @@ struct picolVar {
     struct picolVar *next;
 };
 
-struct picolInterp; /* forward declaration */
-typedef int (*picolCmdFunc)(struct picolInterp *i, int argc, char **argv, void *privdata);
+struct picolInterp;     // Forward declarations
+struct picolCmd;
+typedef int (*picolCmdFunc)(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd);
 
 struct picolCmd {
     char *name;
     picolCmdFunc func;
-    void *privdata;
     struct picolCmd *next;
+    // Aux data for user defined procedures:
+    char *arglist;
+    char *body;
 };
 
 struct picolCallFrame {
@@ -77,7 +118,7 @@ void picolInitParser(struct picolParser *p, char *text) {
 
 int picolParseSep(struct picolParser *p) {
     p->start = p->p;
-    while(*p->p == ' ' || *p->p == '\t' || *p->p == '\n' || *p->p == '\r') {
+    while(*p->p == ' ' || *p->p == '\t') {
         p->p++; p->len--;
     }
     p->end = p->p-1;
@@ -231,10 +272,10 @@ int picolGetToken(struct picolParser *p) {
             return PICOL_OK;
         }
         switch(*p->p) {
-        case ' ': case '\t': case '\r':
+        case ' ': case '\t':
             if (p->insidequote) return picolParseString(p);
             return picolParseSep(p);
-        case '\n': case ';':
+        case '\n': case '\r': case ';':
             if (p->insidequote) return picolParseString(p);
             return picolParseEol(p);
         case '[':
@@ -254,22 +295,30 @@ int picolGetToken(struct picolParser *p) {
     return PICOL_OK; /* unreached */
 }
 
-void picolInitInterp(struct picolInterp *i) {
+/* =============================================================================
+ * Eval and related functions
+ * ========================================================================== */
+
+struct picolInterp *picolInitInterp(void) {
+    struct picolInterp *i = xmalloc(sizeof(*i));
     i->level = 0;
-    i->callframe = malloc(sizeof(struct picolCallFrame));
+    i->callframe = xmalloc(sizeof(struct picolCallFrame));
+    i->result = xstrdup("");
     i->callframe->vars = NULL;
     i->callframe->parent = NULL;
     i->commands = NULL;
-    i->result = strdup("");
+    return i;
 }
 
 void picolSetResult(struct picolInterp *i, char *s) {
     free(i->result);
-    i->result = strdup(s);
+    i->result = xstrdup(s);
 }
 
 struct picolVar *picolGetVar(struct picolInterp *i, char *name) {
-    struct picolVar *v = i->callframe->vars;
+    struct picolCallFrame *cf = i->callframe;
+    if (isupper(name[0])) while(cf->parent) cf = cf->parent;
+    struct picolVar *v = cf->vars;
     while(v) {
         if (strcmp(v->name,name) == 0) return v;
         v = v->next;
@@ -277,34 +326,20 @@ struct picolVar *picolGetVar(struct picolInterp *i, char *name) {
     return NULL;
 }
 
-int picolSetVar(struct picolInterp *i, char *name, char *val) {
+void picolSetVar(struct picolInterp *i, char *name, char *val) {
     struct picolVar *v = picolGetVar(i,name);
     if (v) {
         free(v->val);
-        v->val = strdup(val);
-        if (!v->val) {
-            picolSetResult(i,"Out of memory updating variable");
-            return PICOL_ERR;
-        }
+        v->val = xstrdup(val);
     } else {
-        v = malloc(sizeof(*v));
-        if (!v) {
-            picolSetResult(i,"Out of memory setting variable");
-            return PICOL_ERR;
-        }
-        v->name = strdup(name);
-        v->val = strdup(val);
-        if (!v->name || !v->val) {
-            if (v->name) free(v->name);
-            if (v->val) free(v->val);
-            free(v);
-            picolSetResult(i,"Out of memory setting variable");
-            return PICOL_ERR;
-        }
-        v->next = i->callframe->vars;
-        i->callframe->vars = v;
+        v = xmalloc(sizeof(*v));
+        v->name = xstrdup(name);
+        v->val = xstrdup(val);
+        struct picolCallFrame *cf = i->callframe;
+        if (isupper(name[0])) while(cf->parent) cf = cf->parent;
+        v->next = cf->vars;
+        cf->vars = v;
     }
-    return PICOL_OK;
 }
 
 struct picolCmd *picolGetCommand(struct picolInterp *i, char *name) {
@@ -316,28 +351,27 @@ struct picolCmd *picolGetCommand(struct picolInterp *i, char *name) {
     return NULL;
 }
 
-int picolRegisterCommand(struct picolInterp *i, char *name, picolCmdFunc f, void *privdata) {
+void picolRegisterCommand(struct picolInterp *i, char *name, picolCmdFunc f) {
     struct picolCmd *c = picolGetCommand(i,name);
-    char errbuf[1024];
-    if (c) {
-        snprintf(errbuf,1024,"Command '%s' already defined",name);
-        picolSetResult(i,errbuf);
-        return PICOL_ERR;
-    }
+    int existing = c != NULL;
 
-    c = malloc(sizeof(*c));
-    if (c) c->name = strdup(name);
-    if (c == NULL || c->name == NULL) {
-        if (c) free(c->name);
-        free(c);
-        picolSetResult(i,"Out of memory registering command");
-        return PICOL_ERR;
+    if (!existing) {
+        c = xmalloc(sizeof(*c));
+        c->name = NULL;
+        c->arglist = NULL;
+        c->body = NULL;
+    } else {
+        free(c->arglist);
+        free(c->body);
+        c->arglist = NULL;
+        c->body = NULL;
     }
+    if (!c->name) c->name = xstrdup(name);
     c->func = f;
-    c->privdata = privdata;
-    c->next = i->commands;
-    i->commands = c;
-    return PICOL_OK;
+    if (!existing) {
+        c->next = i->commands;
+        i->commands = c;
+    }
 }
 
 /* EVAL! */
@@ -357,27 +391,43 @@ int picolEval(struct picolInterp *i, char *t) {
         if (p.type == PT_EOF) break;
         tlen = p.end-p.start+1;
         if (tlen < 0) tlen = 0;
-        t = malloc(tlen+1);
+        t = xmalloc(tlen+1);
         memcpy(t, p.start, tlen);
         t[tlen] = '\0';
         if (p.type == PT_VAR) {
             struct picolVar *v = picolGetVar(i,t);
             if (!v) {
-                snprintf(errbuf,1024,"No such variable '%s'",t);
+                snprintf(errbuf,sizeof(errbuf),"No such variable '%s'",t);
                 free(t);
                 picolSetResult(i,errbuf);
                 retcode = PICOL_ERR;
                 goto err;
             }
             free(t);
-            t = strdup(v->val);
+            t = xstrdup(v->val);
         } else if (p.type == PT_CMD) {
             retcode = picolEval(i,t);
             free(t);
             if (retcode != PICOL_OK) goto err;
-            t = strdup(i->result);
+            t = xstrdup(i->result);
         } else if (p.type == PT_ESC) {
-            /* XXX: escape handling missing! */
+            /* Process escapes turning \<something> into
+             * a single char. No need for a second buffer, the result
+             * is always equal or shorter than the original string. */
+            char *src = t, *dst = t;
+            while (*src) {
+                if (*src == '\\' && *(src+1)) {
+                    src++; // skip the "\"
+                    switch(*src) {
+                    case 'n': *dst++ = '\n'; break;
+                    case 't': *dst++ = '\t'; break;
+                    case 'r': *dst++ = '\r'; break;
+                    default: *dst++ = *src; break;
+                    }
+                } else *dst++ = *src;
+                src++;
+            }
+            *dst = '\0';
         } else if (p.type == PT_SEP) {
             prevtype = p.type;
             free(t);
@@ -390,12 +440,12 @@ int picolEval(struct picolInterp *i, char *t) {
             prevtype = p.type;
             if (argc) {
                 if ((c = picolGetCommand(i,argv[0])) == NULL) {
-                    snprintf(errbuf,1024,"No such command '%s'",argv[0]);
+                    snprintf(errbuf,sizeof(errbuf),"No such command '%s'",argv[0]);
                     picolSetResult(i,errbuf);
                     retcode = PICOL_ERR;
                     goto err;
                 }
-                retcode = c->func(i,argc,argv,c->privdata);
+                retcode = c->func(i,argc,argv,c);
                 if (retcode != PICOL_OK) goto err;
             }
             /* Prepare for the next command */
@@ -407,12 +457,14 @@ int picolEval(struct picolInterp *i, char *t) {
         }
         /* We have a new token, append to the previous or as new arg? */
         if (prevtype == PT_SEP || prevtype == PT_EOL) {
-            argv = realloc(argv, sizeof(char*)*(argc+1));
+            /* New argument of the current command. */
+            argv = xrealloc(argv, sizeof(char*)*(argc+1));
             argv[argc] = t;
             argc++;
-        } else { /* Interpolation */
+        } else {
+            /* Interpolation: concatenate to the old argument. */
             int oldlen = strlen(argv[argc-1]), tlen = strlen(t);
-            argv[argc-1] = realloc(argv[argc-1], oldlen+tlen+1);
+            argv[argc-1] = xrealloc(argv[argc-1], oldlen+tlen+1);
             memcpy(argv[argc-1]+oldlen, t, tlen);
             argv[argc-1][oldlen+tlen]='\0';
             free(t);
@@ -425,79 +477,181 @@ err:
     return retcode;
 }
 
-/* ACTUAL COMMANDS! */
+/* This is a "Pratt style parser" for expressions: precedence is encoded in a
+ * single recursive function. Basically the C call stack replaces the explicit
+ * stack here.
+ *
+ * Precedences:
+ *  0 ||, 1 &&, 2 comparisons, 3 add/sub, 4 mul/div, 5 unary.
+ *
+ * Note: picolExpr() is designed to be simple, not fully functional, so it
+ * does not expand $vars and [commands]. [expr $a + [foo]] works, but
+ * [expr {$a + [foo]}] will not. Also: no short circuits with && ||
+ */
+double picolExpr(char **p, int *err, int prec) {
+    double a; char *e;
+
+    /* Step 1: parse the left operand. */
+    while (**p && strchr(" \t\r\n", **p)) (*p)++;
+    if (**p == '(') {
+        (*p)++; a = picolExpr(p,err,0);
+        while (**p && strchr(" \t\r\n", **p)) (*p)++;
+        if (**p == ')') (*p)++; else *err = 1;
+    } else if (**p == '-') { (*p)++; a = -picolExpr(p,err,5);
+    } else if (**p == '+') { (*p)++; a = picolExpr(p,err,5);
+    } else { a = strtod(*p,&e); if (e == *p) *err = 1; *p = e; }
+    while (**p && strchr(" \t\r\n", **p)) (*p)++;
+
+    while (1) {
+        /* Step 2: parse the operator */
+        int op, oprec, len = 1;
+        if (**p == '|' && *(*p+1) == '|') { op = 'o'; oprec = 0; len = 2; }
+        else if (**p == '&' && *(*p+1) == '&') { op = 'a'; oprec = 1; len = 2; }
+        else if (**p == '*' || **p == '/') { op = **p; oprec = 4; }
+        else if (**p == '+' || **p == '-') { op = **p; oprec = 3; }
+        else if (**p == '<' && *(*p+1) == '=') { op = 'L'; oprec = 2; len = 2; }
+        else if (**p == '>' && *(*p+1) == '=') { op = 'G'; oprec = 2; len = 2; }
+        else if (**p == '=' && *(*p+1) == '=') { op = 'E'; oprec = 2; len = 2; }
+        else if (**p == '!' && *(*p+1) == '=') { op = 'N'; oprec = 2; len = 2; }
+        else if (**p == '<') { op = '<'; oprec = 2; }
+        else if (**p == '>') { op = '>'; oprec = 2; }
+        else break; // No more operators to consume: \0, ), or syntax error.
+
+        /* Step 3: if the operator has high enough precedence, parse the right
+         * operand with a recursive call (effectively processing higher
+         * precedence operators in the recursive call), and execute the
+         * operation. */
+        if (oprec < prec) break;
+        *p += len;
+        double b = picolExpr(p,err,oprec+1);
+        switch(op) {
+        case '+': a += b; break; case '-': a -= b; break;
+        case '*': a *= b; break; case '/': a /= b; break;
+        case '<': a = a < b; break; case '>': a = a > b; break;
+        case 'L': a = a <= b; break; case 'G': a = a >= b; break;
+        case 'E': a = a == b; break; case 'N': a = a != b; break;
+        case 'o': a = a || b; break; case 'a': a = a && b; break;
+        }
+        while (**p && strchr(" \t\r\n", **p)) (*p)++;
+    }
+    return a;
+}
+
+/* Trick: wrap 's' as "expr <s>" and evaluate it, so that picolEval handles
+ * $var and [cmd] substitution before expr parses pure math expression.
+ * This is used in [if] and [while] condition evaluation. */
+int picolExprExpansion(struct picolInterp *i, char *s) {
+    int len = strlen(s);
+    char *e = xmalloc(len+6); /* "expr " + s + \0 */
+    memcpy(e,"expr ",5);
+    memcpy(e+5,s,len+1);
+    int retcode = picolEval(i,e);
+    free(e);
+    return retcode;
+}
+
+/* =============================================================================
+ * Standard library of commands
+ * ========================================================================== */
+
 int picolArityErr(struct picolInterp *i, char *name) {
     char buf[1024];
-    snprintf(buf,1024,"Wrong number of args for %s",name);
+    snprintf(buf,sizeof(buf),"Wrong number of args for %s",name);
     picolSetResult(i,buf);
     return PICOL_ERR;
 }
 
-int picolCommandMath(struct picolInterp *i, int argc, char **argv, void *pd) {
-    char buf[64]; int a, b, c;
-    if (argc != 3) return picolArityErr(i,argv[0]);
-    a = atoi(argv[1]); b = atoi(argv[2]);
-    if (argv[0][0] == '+') c = a+b;
-    else if (argv[0][0] == '-') c = a-b;
-    else if (argv[0][0] == '*') c = a*b;
-    else if (argv[0][0] == '/') {
-        if (b == 0) {
-            picolSetResult(i,"Division by zero");
-            return PICOL_ERR;
-        }
-        c = a/b;
+/* expr a + b * c ... (no var or command expansions! Don't quote expressions) */
+int picolCommandExpr(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
+    char buf[64]; int err = 0, j, len = 0;
+    if (argc < 2) return picolArityErr(i,argv[0]);
+    for (j = 1; j < argc; j++) len += strlen(argv[j]) + 1;
+    char *expr = xmalloc(len), *p = expr;
+    for (j = 1; j < argc; j++) {
+        int l = strlen(argv[j]);
+        if (j > 1) *p++ = ' ';
+        memcpy(p,argv[j],l); p += l;
     }
-    else if (argv[0][0] == '>' && argv[0][1] == '\0') c = a > b;
-    else if (argv[0][0] == '>' && argv[0][1] == '=') c = a >= b;
-    else if (argv[0][0] == '<' && argv[0][1] == '\0') c = a < b;
-    else if (argv[0][0] == '<' && argv[0][1] == '=') c = a <= b;
-    else if (argv[0][0] == '=' && argv[0][1] == '=') c = a == b;
-    else if (argv[0][0] == '!' && argv[0][1] == '=') c = a != b;
-    else c = 0; /* I hate warnings */
-    snprintf(buf,64,"%d",c);
-    picolSetResult(i,buf);
+    *p = '\0'; p = expr;
+    double v = picolExpr(&p,&err,0);
+    while (*p == ' ') p++;
+    if (*p != '\0') err = 1;
+    free(expr);
+    if (err) { picolSetResult(i,"Error in expression"); return PICOL_ERR; }
+    snprintf(buf,sizeof(buf),"%.12g",v);
+    picolSetResult(i,buf); return PICOL_OK;
+}
+
+/* set var ?value? */
+int picolCommandSet(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
+    if (argc == 3) {
+        picolSetVar(i,argv[1],argv[2]);
+        picolSetResult(i,argv[2]);
+    } else if (argc == 2) {
+        struct picolVar *v = picolGetVar(i,argv[1]);
+        if (v == NULL) {
+            char buf[1024];
+            snprintf(buf,sizeof(buf),
+                "Can't read \"%s\": no such variable",argv[1]);
+            picolSetResult(i,buf);
+            return PICOL_ERR;
+        } else {
+            picolSetResult(i,v->val);
+        }
+    } else {
+        return picolArityErr(i,argv[0]);
+    }
     return PICOL_OK;
 }
 
-int picolCommandSet(struct picolInterp *i, int argc, char **argv, void *pd) {
-    if (argc != 3) return picolArityErr(i,argv[0]);
-    picolSetVar(i,argv[1],argv[2]);
-    picolSetResult(i,argv[2]);
+/* puts ?-nonewline? string */
+int picolCommandPuts(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
+    int nonl = (argc == 3 && !strcmp(argv[1],"-nonewline"));
+    if (argc != 2 && !nonl) return picolArityErr(i,argv[0]);
+    printf("%s%s", argv[nonl?2:1], nonl ? "" : "\n");
     return PICOL_OK;
 }
 
-int picolCommandPuts(struct picolInterp *i, int argc, char **argv, void *pd) {
-    if (argc != 2) return picolArityErr(i,argv[0]);
-    printf("%s\n", argv[1]);
-    return PICOL_OK;
+/* if cond body ?elseif cond body ...? ?else body? */
+int picolCommandIf(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
+    int retcode, j = 1;
+    while (1) {
+        if (j >= argc) return picolArityErr(i,argv[0]);
+        /* Evaluate condition of this branch. */
+        retcode = picolExprExpansion(i,argv[j]);
+        if (retcode != PICOL_OK) return retcode;
+        if (j+1 >= argc) return picolArityErr(i,argv[0]);
+        /* True? Eval the corresponding branch and return. */
+        if (strtod(i->result,NULL)) return picolEval(i,argv[j+1]);
+        j += 2;
+        if (j >= argc) return PICOL_OK; // No more branches.
+        /* Else statement? Evaluate the else branch (condition was false)
+         * if we are here. */
+        if (!strcmp(argv[j],"else"))
+            return (j+1 < argc) ? picolEval(i,argv[j+1]) :
+                                  picolArityErr(i,argv[0]);
+        /* We expect elseif now, or there is a syntax error. */
+        if (strcmp(argv[j],"elseif")) return picolArityErr(i,argv[0]);
+        j++;
+    }
 }
 
-int picolCommandIf(struct picolInterp *i, int argc, char **argv, void *pd) {
-    int retcode;
-    if (argc != 3 && argc != 5) return picolArityErr(i,argv[0]);
-    if ((retcode = picolEval(i,argv[1])) != PICOL_OK) return retcode;
-    if (atoi(i->result)) return picolEval(i,argv[2]);
-    else if (argc == 5) return picolEval(i,argv[4]);
-    return PICOL_OK;
-}
-
-int picolCommandWhile(struct picolInterp *i, int argc, char **argv, void *pd) {
+/* while cond body */
+int picolCommandWhile(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
     if (argc != 3) return picolArityErr(i,argv[0]);
     while(1) {
-        int retcode = picolEval(i,argv[1]);
+        int retcode = picolExprExpansion(i,argv[1]);
         if (retcode != PICOL_OK) return retcode;
-        if (atoi(i->result)) {
-            if ((retcode = picolEval(i,argv[2])) == PICOL_CONTINUE) continue;
-            else if (retcode == PICOL_OK) continue;
-            else if (retcode == PICOL_BREAK) return PICOL_OK;
-            else return retcode;
-        } else {
-            return PICOL_OK;
-        }
+        if (!strtod(i->result,NULL)) return PICOL_OK;
+        retcode = picolEval(i,argv[2]);
+        if (retcode == PICOL_CONTINUE || retcode == PICOL_OK) continue;
+        else if (retcode == PICOL_BREAK) return PICOL_OK;
+        else return retcode;
     }
 }
 
-int picolCommandRetCodes(struct picolInterp *i, int argc, char **argv, void *pd) {
+/* break and continue. */
+int picolCommandRetCodes(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
     if (argc != 1) return picolArityErr(i,argv[0]);
     if (strcmp(argv[0],"break") == 0) return PICOL_BREAK;
     else if (strcmp(argv[0],"continue") == 0) return PICOL_CONTINUE;
@@ -518,9 +672,24 @@ void picolDropCallFrame(struct picolInterp *i) {
     free(cf);
 }
 
-int picolCommandCallProc(struct picolInterp *i, int argc, char **argv, void *pd) {
-    char **x=pd, *alist=x[0], *body=x[1], *p=strdup(alist), *tofree;
-    struct picolCallFrame *cf = malloc(sizeof(*cf));
+void picolFreeInterp(struct picolInterp *i) {
+    while(i->callframe) picolDropCallFrame(i);
+    while(i->commands) {
+        struct picolCmd *c = i->commands;
+        i->commands = c->next;
+        free(c->name);
+        free(c->arglist);
+        free(c->body);
+        free(c);
+    }
+    free(i->result);
+    free(i);
+}
+
+/* The callback used for user defined procedures. */
+int picolCommandCallProc(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
+    char *alist=cmd->arglist, *body=cmd->body, *p=xstrdup(alist), *tofree;
+    struct picolCallFrame *cf = xmalloc(sizeof(*cf));
     int arity = 0, done = 0, errcode = PICOL_OK;
     char errbuf[1024];
     cf->vars = NULL;
@@ -536,83 +705,75 @@ int picolCommandCallProc(struct picolInterp *i, int argc, char **argv, void *pd)
         if (p == start) break;
         if (*p == '\0') done=1; else *p = '\0';
         if (++arity > argc-1) goto arityerr;
+        if (isupper(start[0])) {
+            snprintf(errbuf,sizeof(errbuf),"Procedure parameter '%s' can't be a global (upcase first character)", start);
+            goto err;
+        }
         picolSetVar(i,start,argv[arity]);
         p++;
         if (done) break;
     }
     free(tofree);
+    tofree = NULL;
     if (arity != argc-1) goto arityerr;
     errcode = picolEval(i,body);
     if (errcode == PICOL_RETURN) errcode = PICOL_OK;
     picolDropCallFrame(i); /* remove the called proc callframe */
     return errcode;
 arityerr:
-    snprintf(errbuf,1024,"Proc '%s' called with wrong arg num",argv[0]);
+    snprintf(errbuf,sizeof(errbuf),"Proc '%s' called with wrong arg num",argv[0]);
+err:
     picolSetResult(i,errbuf);
     free(tofree);
     picolDropCallFrame(i); /* remove the called proc callframe */
     return PICOL_ERR;
 }
 
-int picolCommandProc(struct picolInterp *i, int argc, char **argv, void *pd) {
-    char **procdata = malloc(sizeof(char*)*2);
-    if (!procdata) {
-        picolSetResult(i,"Out of memory registering proc");
-        return PICOL_ERR;
-    }
-    procdata[0] = procdata[1] = NULL;
+int picolCommandProc(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
+    if (argc != 4) return picolArityErr(i,argv[0]);
 
-    if (argc != 4) {
-        free(procdata);
-        return picolArityErr(i,argv[0]);
-    }
-
-    procdata[0] = strdup(argv[2]); /* Arguments list. */
-    procdata[1] = strdup(argv[3]); /* Procedure body. */
-    if (procdata[0] == NULL || procdata[1] == NULL) goto oom;
-    return picolRegisterCommand(i,argv[1],picolCommandCallProc,procdata);
-
-oom:
-    free(procdata[0]); /* Safe to free NULL */
-    free(procdata[1]);
-    free(procdata);
-    picolSetResult(i,"Out of memory registering proc");
-    return PICOL_ERR;
+    picolRegisterCommand(i,argv[1],picolCommandCallProc);
+    struct picolCmd *c = picolGetCommand(i,argv[1]);
+    c->arglist = xstrdup(argv[2]);
+    c->body = xstrdup(argv[3]);
+    return PICOL_OK;
 }
 
-int picolCommandReturn(struct picolInterp *i, int argc, char **argv, void *pd) {
+int picolCommandReturn(struct picolInterp *i, int argc, char **argv, struct picolCmd *cmd) {
     if (argc != 1 && argc != 2) return picolArityErr(i,argv[0]);
     picolSetResult(i, (argc == 2) ? argv[1] : "");
     return PICOL_RETURN;
 }
 
 void picolRegisterCoreCommands(struct picolInterp *i) {
-    int j; char *name[] = {"+","-","*","/",">",">=","<","<=","==","!="};
-    for (j = 0; j < (int)(sizeof(name)/sizeof(char*)); j++)
-        picolRegisterCommand(i,name[j],picolCommandMath,NULL);
-    picolRegisterCommand(i,"set",picolCommandSet,NULL);
-    picolRegisterCommand(i,"puts",picolCommandPuts,NULL);
-    picolRegisterCommand(i,"if",picolCommandIf,NULL);
-    picolRegisterCommand(i,"while",picolCommandWhile,NULL);
-    picolRegisterCommand(i,"break",picolCommandRetCodes,NULL);
-    picolRegisterCommand(i,"continue",picolCommandRetCodes,NULL);
-    picolRegisterCommand(i,"proc",picolCommandProc,NULL);
-    picolRegisterCommand(i,"return",picolCommandReturn,NULL);
+    picolRegisterCommand(i,"expr",picolCommandExpr);
+    picolRegisterCommand(i,"set",picolCommandSet);
+    picolRegisterCommand(i,"puts",picolCommandPuts);
+    picolRegisterCommand(i,"if",picolCommandIf);
+    picolRegisterCommand(i,"while",picolCommandWhile);
+    picolRegisterCommand(i,"break",picolCommandRetCodes);
+    picolRegisterCommand(i,"continue",picolCommandRetCodes);
+    picolRegisterCommand(i,"proc",picolCommandProc);
+    picolRegisterCommand(i,"return",picolCommandReturn);
 }
 
+/* =============================================================================
+ * Main and REPL
+ * ========================================================================== */
+
+#ifndef PICOL_NO_MAIN // In case you want to include it as a library.
 int main(int argc, char **argv) {
-    struct picolInterp interp;
-    picolInitInterp(&interp);
-    picolRegisterCoreCommands(&interp);
+    struct picolInterp *interp = picolInitInterp();
+    picolRegisterCoreCommands(interp);
     if (argc == 1) {
         while(1) {
             char clibuf[1024];
             int retcode;
             printf("picol> "); fflush(stdout);
             if (fgets(clibuf,1024,stdin) == NULL) return 0;
-            retcode = picolEval(&interp,clibuf);
-            if (interp.result[0] != '\0')
-                printf("[%d] %s\n", retcode, interp.result);
+            retcode = picolEval(interp,clibuf);
+            if (interp->result[0] != '\0')
+                printf("[%d] %s\n", retcode, interp->result);
         }
     } else if (argc == 2) {
         char buf[1024*16];
@@ -623,7 +784,9 @@ int main(int argc, char **argv) {
         size_t bytesRead = fread(buf,1,1024*16-1,fp);
         buf[bytesRead] = '\0';
         fclose(fp);
-        if (picolEval(&interp,buf) != PICOL_OK) printf("%s\n", interp.result);
+        if (picolEval(interp,buf) != PICOL_OK) printf("%s\n", interp->result);
     }
+    picolFreeInterp(interp);
     return 0;
 }
+#endif
