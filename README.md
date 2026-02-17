@@ -71,7 +71,7 @@ while {$a < 10} {
 
 Version 2 added the following features without making the source code much larger or more complicated:
 
-* Removed malloc() OOM checks and pointless recovery in this case. Now aborting wrappers are used instead: xmalloc() and xrealloc(). This allowed to reclaim a few tens of lines of code that were used to implement and other features. Also, in this specific case, OOM recovery complicated the code driving away the attention of the reader on such details.
+* Removed malloc() OOM checks and pointless recovery in this case. Now aborting wrappers are used instead: xmalloc() and xrealloc(). This allowed to reclaim a few tens of lines of code, later used to implement other features. Also, in this specific case, OOM recovery complicated the code driving away the attention of the reader on such details.
 * A working `expr`! Also used for `if` and `while` conditions.
 * Numbers are now floats, not integers. More real world programs can be written.
 * Puts has a `-nonewline` option, like Tcl.
@@ -87,15 +87,15 @@ The limit of the 500 lines of code is no longer strictly respected in this versi
 
 ## Design
 
-* The first important part you see in the source code is a hand written parser. The main function of the parser is `picolGetToken` that just calls functions able to parse the different parts of a Tcl program and return in the parsing structure the type of the token and start/end pointers in order to extract it.
+The first important part you see in the source code is a **hand written parser**. The main function of the parser is `picolGetToken` that just calls functions able to parse the different parts of a Tcl program and return in the parsing structure the type of the token and start/end pointers in order to extract it.
 
-This parsing function is in turn used by `picolEval` in order to execute the program. Every token is used either to form a new argument if a separator token was found before, or concatenated to the last argument (this is how interpolation is performed in Picol). Once an EOL (end of line) token is returned picolEval will call the command looking it up in a linked list of commands stored inside the interpreter structure.
+This parsing function is in turn used by `picolEval` **in order to execute the program**. Every token is used either to form a new argument if a separator token was found before, or concatenated to the last argument (this is how interpolation is performed in Picol). Once an EOL (end of line) token is returned picolEval will call the command looking it up in a linked list of commands stored inside the interpreter structure.
 
-Variables and commands substitution is performed by `picolEval` itself. The parser is able to return variables and commands tokens already stripped by `$` and `[]`, so all that's required is to lookup the variable in the call frame and substitute the value with the token, or to recursively call `picolEval` if it's a command substitution, using the result instead of the original token.
+**Variables and commands substitution is performed by `picolEval` itself**. The parser is able to return variables and commands tokens already stripped by `$` and `[]`, so all that's required is to lookup the variable in the call frame and substitute the value with the token, or to recursively call `picolEval` if it's a command substitution, using the result instead of the original token.
 
-Commands are described by a name and a pointer to a C function implementing the command. In the command structure there is also a pointer used in order to store the procedure arguments list and body. This makes you able to implement multiple Picol commands using a single C function. User defined procedures are just like commands, but they are implemented by passing the argument list and the body of the procedure as additional pointers, so a single C function is able to implement all the existing user defined procedures.
+**Commands are described by a name and a pointer to a C function** implementing the command. In the command structure there is also a pointer used in order to store the procedure arguments list and body. This makes you able to implement multiple Picol commands using a single C function. User defined procedures are just like commands, but they are implemented by passing the argument list and the body of the procedure as additional pointers, so a single C function is able to implement all the existing user defined procedures.
 
-Procedures call is trivial. The interpreter structure contains a call frame structure having more or less just a pointer to a linked list of variables (that are in turn structures with two fields: name and value). When a procedure is called a new call frame is created and put at the top of the old one. When the procedure returns the top call frame is destroyed.
+Procedures call is trivial. The interpreter structure contains a **call frame structure having more or less just a pointer to a linked list** of variables (that are in turn structures with two fields: name and value). When a procedure is called a new call frame is created and put at the top of the old one. When the procedure returns the top call frame is destroyed.
 
 ## Expr implementation
 
