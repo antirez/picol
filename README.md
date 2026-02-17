@@ -71,7 +71,8 @@ while {$a < 10} {
 
 Version 2 added the following features without making the source code much larger or more complicated:
 
-* Removed malloc() OOM checks and pointless recovery in this case. Now aborting wrappers are used instead: xmalloc() and xrealloc(). This allowed to reclaim a few tens of lines of code that were used to implement `expr` and other features. Also, in this specific case, OOM recovery complicated the code driving away the attention of the reader on such details.
+* Removed malloc() OOM checks and pointless recovery in this case. Now aborting wrappers are used instead: xmalloc() and xrealloc(). This allowed to reclaim a few tens of lines of code that were used to implement and other features. Also, in this specific case, OOM recovery complicated the code driving away the attention of the reader on such details.
+* A working `expr`! Also used for `if` and `while` conditions.
 * Numbers are now floats, not integers. More real world programs can be written.
 * Puts has a `-nonewline` option, like Tcl.
 * `if` now supports `elseif` chains.
@@ -98,7 +99,7 @@ Procedures call is trivial. The interpreter structure contains a call frame stru
 
 ## Expr implementation
 
-The usual way to implement an expression evaluator in C is to use two stacks, one for the operators and one for the operands. This is efficient and straightforward to implement, but here the need was to write a good enough Tcl `expr` in a lot less space (37 lines of code in total). So I resorted to a *Pratt style parser*, likely the most compact way to write a parser as a recursive function. In this parser the grammar is modeled as a set of mutually recursive functions, but in this specific case it is just *a single* recursive function.
+The usual way to implement an expression evaluator in C is to use two stacks, one for the operators and one for the operands. This is efficient and straightforward to implement, but here the need was to write a good enough Tcl `expr` in a lot less space (41 lines of code in total). So I resorted to a *Pratt style parser*, likely the most compact way to write a parser as a recursive function. In this parser the grammar is modeled as a set of mutually recursive functions, but in this specific case it is just *a single* recursive function.
 
 The evaluator works in two steps (three in the code comments, to simplify the understanding even more, but they are logically two):
 
