@@ -204,6 +204,42 @@ int main(void) {
     test(++t, "braced arg in command sub",
         eval_ok(interp, "set r [set v {hello world}]", "hello world"));
 
+    /* Security: OOB read in picolParseCommand with trailing backslash. */
+    test(++t, "parse cmd trailing backslash no crash",
+        picolEval(interp, "[\\") != -1); /* Must not crash. */
+
+    /* Security: unbounded recursion via nested command substitution. */
+    {
+        char deep[512];
+        memset(deep, '[', 200);
+        memcpy(deep+200, "set x 1", 7);
+        memset(deep+207, ']', 200);
+        deep[407] = '\0';
+        test(++t, "deep command nesting returns error",
+            picolEval(interp, deep) == PICOL_ERR);
+    }
+
+    /* Security: unbounded recursion via self-recursive proc. */
+    test(++t, "self-recursive proc returns error",
+        picolEval(interp, "proc bomb {} { bomb }; bomb") == PICOL_ERR);
+
+    /* Security: unbounded recursion via nested expression parentheses. */
+    {
+        const int depth = 2000;
+        /* len is: "expr " + '(' * n + '1' + ')' * n + '\0' */
+        size_t len = 5 + (size_t)depth * 2 + 2; /* +2 for '1' and '\0' */
+        char *deep_expr = malloc(len);
+        char *p = deep_expr;
+        memcpy(p, "expr ", 5); p += 5;
+        memset(p, '(', depth); p += depth;
+        *p++ = '1';
+        memset(p, ')', depth); p += depth;
+        *p = '\0';
+        test(++t, "deep expr nesting returns error",
+            picolEval(interp, deep_expr) == PICOL_ERR);
+        free(deep_expr);
+    }
+
     /* set with one argument (read). */
     test(++t, "set read existing var",
         eval_ok(interp, "set myvar 123; set myvar", "123"));

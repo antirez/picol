@@ -83,7 +83,7 @@ Version 2 added the following features without making the source code much large
 * The code is more commented and readable.
 * Bugs were fixed.
 
-The limit of the 500 lines of code is no longer strictly respected in this version. Currently `loc` reports 654 lines.
+The limit of the 500 lines of code is no longer strictly respected in this version. Currently `loc` reports 669 lines.
 
 ## Design
 

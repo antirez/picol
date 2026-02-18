@@ -58,6 +58,8 @@ char *xstrdup(const char *s) {
  * Data structures
  * ========================================================================== */
 
+#define PICOL_MAX_RECURSION_LEVEL 128
+
 enum {PICOL_OK, PICOL_ERR, PICOL_RETURN, PICOL_BREAK, PICOL_CONTINUE};
 enum {
     PT_ESC, // String that may contain escapes (that should be processed)
@@ -150,7 +152,9 @@ int picolParseCommand(struct picolParser *p) {
         } else if (*p->p == ']' && blevel == 0) {
             if (!--level) break;
         } else if (*p->p == '\\') {
-            p->p++; p->len--;
+            if (p->len >= 2) {
+                p->p++; p->len--;
+            }
         } else if (*p->p == '{') {
             blevel++;
         } else if (*p->p == '}') {
@@ -382,6 +386,11 @@ int picolEval(struct picolInterp *i, char *t) {
     char errbuf[1024];
     int retcode = PICOL_OK;
     picolSetResult(i,"");
+    if (++i->level > PICOL_MAX_RECURSION_LEVEL) {
+        i->level--;
+        picolSetResult(i,"Nesting too deep");
+        return PICOL_ERR;
+    }
     picolInitParser(&p,t);
     while(1) {
         char *t;
@@ -474,6 +483,7 @@ int picolEval(struct picolInterp *i, char *t) {
 err:
     for (j = 0; j < argc; j++) free(argv[j]);
     free(argv);
+    i->level--;
     return retcode;
 }
 
@@ -488,17 +498,23 @@ err:
  * does not expand $vars and [commands]. [expr $a + [foo]] works, but
  * [expr {$a + [foo]}] will not. Also: no short circuits with && ||
  */
-double picolExpr(char **p, int *err, int prec) {
+double picolExpr(struct picolInterp *i, char **p, int *err, int prec) {
     double a; char *e;
+
+    if (++i->level > PICOL_MAX_RECURSION_LEVEL) {
+        i->level--;
+        *err = 1; // Will be reported as error in expression, instead of
+        return 0; // recursion limit. Requires a pathological expression anyway.
+    }
 
     /* Step 1: parse the left operand. */
     while (**p && strchr(" \t\r\n", **p)) (*p)++;
     if (**p == '(') {
-        (*p)++; a = picolExpr(p,err,0);
+        (*p)++; a = picolExpr(i,p,err,0);
         while (**p && strchr(" \t\r\n", **p)) (*p)++;
         if (**p == ')') (*p)++; else *err = 1;
-    } else if (**p == '-') { (*p)++; a = -picolExpr(p,err,5);
-    } else if (**p == '+') { (*p)++; a = picolExpr(p,err,5);
+    } else if (**p == '-') { (*p)++; a = -picolExpr(i,p,err,5);
+    } else if (**p == '+') { (*p)++; a = picolExpr(i,p,err,5);
     } else { a = strtod(*p,&e); if (e == *p) *err = 1; *p = e; }
     while (**p && strchr(" \t\r\n", **p)) (*p)++;
 
@@ -523,7 +539,7 @@ double picolExpr(char **p, int *err, int prec) {
          * operation. */
         if (oprec < prec) break;
         *p += len;
-        double b = picolExpr(p,err,oprec+1);
+        double b = picolExpr(i,p,err,oprec+1);
         switch(op) {
         case '+': a += b; break; case '-': a -= b; break;
         case '*': a *= b; break; case '/': a /= b; break;
@@ -534,6 +550,7 @@ double picolExpr(char **p, int *err, int prec) {
         }
         while (**p && strchr(" \t\r\n", **p)) (*p)++;
     }
+    i->level--;
     return a;
 }
 
@@ -573,7 +590,7 @@ int picolCommandExpr(struct picolInterp *i, int argc, char **argv, struct picolC
         memcpy(p,argv[j],l); p += l;
     }
     *p = '\0'; p = expr;
-    double v = picolExpr(&p,&err,0);
+    double v = picolExpr(i,&p,&err,0);
     while (*p == ' ') p++;
     if (*p != '\0') err = 1;
     free(expr);
