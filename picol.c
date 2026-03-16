@@ -79,6 +79,7 @@ struct picolParser {
     char *end;          // Token end
     int type;           // Token type, PT_...
     int insidequote;    // True if inside " "
+    int line;           // Current line number (starts at 1)
 };
 
 struct picolVar {
@@ -109,6 +110,8 @@ struct picolInterp {
     struct picolCallFrame *callframe;
     struct picolCmd *commands;
     char *result;
+    const char *filename;   // Current source file being evaluated (caller owned)
+    int current_line;       // Line number of current command
 };
 
 void picolInitParser(struct picolParser *p, char *text) {
@@ -116,6 +119,7 @@ void picolInitParser(struct picolParser *p, char *text) {
     p->len = strlen(text);
     p->start = 0; p->end = 0; p->insidequote = 0;
     p->type = PT_EOL;
+    p->line = 1;
 }
 
 int picolParseSep(struct picolParser *p) {
@@ -133,6 +137,7 @@ int picolParseEol(struct picolParser *p) {
     while(*p->p == ' ' || *p->p == '\t' || *p->p == '\n' || *p->p == '\r' ||
           *p->p == ';')
     {
+        if (*p->p == '\n') p->line++;
         p->p++; p->len--;
     }
     p->end = p->p-1;
@@ -147,6 +152,8 @@ int picolParseCommand(struct picolParser *p) {
     while (1) {
         if (p->len == 0) {
             break;
+        } else if (*p->p == '\n') {
+            p->line++;
         } else if (*p->p == '[' && blevel == 0) {
             level++;
         } else if (*p->p == ']' && blevel == 0) {
@@ -194,6 +201,7 @@ int picolParseBrace(struct picolParser *p) {
     int level = 1;
     p->start = ++p->p; p->len--;
     while(1) {
+        if (*p->p == '\n') p->line++;
         if (p->len >= 2 && *p->p == '\\') {
             p->p++; p->len--;
         } else if (p->len == 0 || *p->p == '}') {
@@ -311,6 +319,8 @@ struct picolInterp *picolInitInterp(void) {
     i->callframe->vars = NULL;
     i->callframe->parent = NULL;
     i->commands = NULL;
+    i->filename = NULL;
+    i->current_line = 1;
     return i;
 }
 
@@ -385,6 +395,7 @@ int picolEval(struct picolInterp *i, char *t) {
     char **argv = NULL;
     char errbuf[1024];
     int retcode = PICOL_OK;
+    int saved_line = i->current_line;
     picolSetResult(i,"");
     if (++i->level > PICOL_MAX_RECURSION_LEVEL) {
         i->level--;
@@ -397,6 +408,8 @@ int picolEval(struct picolInterp *i, char *t) {
         int tlen;
         int prevtype = p.type;
         picolGetToken(&p);
+        if (p.type != PT_SEP && p.type != PT_EOL && p.type != PT_EOF && prevtype == PT_EOL)
+            i->current_line = p.line;
         if (p.type == PT_EOF) break;
         tlen = p.end-p.start+1;
         if (tlen < 0) tlen = 0;
@@ -406,7 +419,9 @@ int picolEval(struct picolInterp *i, char *t) {
         if (p.type == PT_VAR) {
             struct picolVar *v = picolGetVar(i,t);
             if (!v) {
-                snprintf(errbuf,sizeof(errbuf),"No such variable '%s'",t);
+                snprintf(errbuf,sizeof(errbuf),"%s:%d: No such variable '%s'",
+                         i->filename ? i->filename : "<eval>",
+                         i->current_line, t);
                 free(t);
                 picolSetResult(i,errbuf);
                 retcode = PICOL_ERR;
@@ -449,7 +464,9 @@ int picolEval(struct picolInterp *i, char *t) {
             prevtype = p.type;
             if (argc) {
                 if ((c = picolGetCommand(i,argv[0])) == NULL) {
-                    snprintf(errbuf,sizeof(errbuf),"No such command '%s'",argv[0]);
+                    snprintf(errbuf,sizeof(errbuf),"%s:%d: No such command '%s'",
+                             i->filename ? i->filename : "<eval>",
+                             i->current_line, argv[0]);
                     picolSetResult(i,errbuf);
                     retcode = PICOL_ERR;
                     goto err;
@@ -484,6 +501,7 @@ err:
     for (j = 0; j < argc; j++) free(argv[j]);
     free(argv);
     i->level--;
+    i->current_line = saved_line;
     return retcode;
 }
 
@@ -573,7 +591,9 @@ int picolExprExpansion(struct picolInterp *i, char *s) {
 
 int picolArityErr(struct picolInterp *i, char *name) {
     char buf[1024];
-    snprintf(buf,sizeof(buf),"Wrong number of args for %s",name);
+    snprintf(buf,sizeof(buf),"%s:%d: Wrong number of args for %s",
+             i->filename ? i->filename : "<eval>",
+             i->current_line, name);
     picolSetResult(i,buf);
     return PICOL_ERR;
 }
@@ -608,8 +628,9 @@ int picolCommandSet(struct picolInterp *i, int argc, char **argv, struct picolCm
         struct picolVar *v = picolGetVar(i,argv[1]);
         if (v == NULL) {
             char buf[1024];
-            snprintf(buf,sizeof(buf),
-                "Can't read \"%s\": no such variable",argv[1]);
+            snprintf(buf,sizeof(buf),"%s:%d: Can't read \"%s\": no such variable",
+                i->filename ? i->filename : "<eval>",
+                i->current_line, argv[1]);
             picolSetResult(i,buf);
             return PICOL_ERR;
         } else {
@@ -723,7 +744,9 @@ int picolCommandCallProc(struct picolInterp *i, int argc, char **argv, struct pi
         if (*p == '\0') done=1; else *p = '\0';
         if (++arity > argc-1) goto arityerr;
         if (isupper(start[0])) {
-            snprintf(errbuf,sizeof(errbuf),"Procedure parameter '%s' can't be a global (upcase first character)", start);
+            snprintf(errbuf,sizeof(errbuf),"%s:%d: Procedure parameter '%s' can't be a global (upcase first character)",
+                     i->filename ? i->filename : "<eval>",
+                     i->current_line, start);
             goto err;
         }
         picolSetVar(i,start,argv[arity]);
@@ -738,7 +761,9 @@ int picolCommandCallProc(struct picolInterp *i, int argc, char **argv, struct pi
     picolDropCallFrame(i); /* remove the called proc callframe */
     return errcode;
 arityerr:
-    snprintf(errbuf,sizeof(errbuf),"Proc '%s' called with wrong arg num",argv[0]);
+    snprintf(errbuf,sizeof(errbuf),"%s:%d: Proc '%s' called with wrong arg num",
+             i->filename ? i->filename : "<eval>",
+             i->current_line, argv[0]);
 err:
     picolSetResult(i,errbuf);
     free(tofree);
@@ -786,6 +811,7 @@ int main(int argc, char **argv) {
         while(1) {
             char clibuf[1024];
             int retcode;
+            interp->filename = "<stdin>";
             printf("picol> "); fflush(stdout);
             if (fgets(clibuf,1024,stdin) == NULL) return 0;
             retcode = picolEval(interp,clibuf);
@@ -801,6 +827,7 @@ int main(int argc, char **argv) {
         size_t bytesRead = fread(buf,1,1024*16-1,fp);
         buf[bytesRead] = '\0';
         fclose(fp);
+        interp->filename = argv[1];
         if (picolEval(interp,buf) != PICOL_OK) printf("%s\n", interp->result);
     }
     picolFreeInterp(interp);
